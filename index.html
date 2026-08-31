@@ -1,8 +1,9 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Basic Missile Command HTML Game</title>
+  <title>NQ Missile Command</title>
   <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
   html, body {
     height: 100%;
@@ -18,7 +19,9 @@
 
   canvas {
     cursor: crosshair;
-    border: 1px solid white;
+    border: 1px solid #444;
+    max-width: 100%;
+    max-height: 100vh;
   }
   </style>
 
@@ -47,50 +50,73 @@ const cityY = groundY - cityHeight;  // y position of the city
 const siloY = groundY - 30;  // y position of the top of the silo
 const missileSize = 4;  // the radius/size of a missile
 
-const missileSpeed = 1;  // how fast a missile moves
 const counterMissileSpeed = 15;  // how fast a counter-missile moves
+const maxExplosionSize = 30;
 
-// information about each missile
+// scoring
+const missileScore = 25;      // points per enemy missile destroyed
+const cityBonus = 100;        // wave-end bonus per surviving city
+const ammoBonus = 5;          // wave-end bonus per unused counter-missile
+
+// game state: 'ready' | 'playing' | 'wave-end' | 'game-over'
+let state = 'ready';
+let stateTime = 0;            // timestamp of the last state change
+let score = 0;
+let waveBonus = 0;
+let level = 1;
+let highScore = 0;
+try { highScore = +localStorage.getItem('nq-mc-highscore') || 0; } catch (e) {}
+
 let missiles = [];
 let counterMissiles = [];
-
-// information about each explosion
 let explosions = [];
+let popups = [];              // floating score texts
 
-// how many missiles to spawn at each interval of the level (in this
-// case spawn 4 missiles at the start of level 1 and 4 more missiles
-// at the next interval of level 1)
-const levels = [ [4, 4] ];
-let currLevel = 0;
-let currInterval = 0;
+// per-wave spawn bookkeeping
+let missilesToSpawn = 0;
+let lastSpawnTime = 0;
 
-// the x/y position of all cities and if the city is currently alive
-let cities = [
-  { x: 140, y: cityY, alive: true },
-  { x: 220, y: cityY, alive: true },
-  { x: 300, y: cityY, alive: true },
-  { x: 500, y: cityY, alive: true },
-  { x: 580, y: cityY, alive: true },
-  { x: 660, y: cityY, alive: true }
-];
+const cityPos = [ 140, 220, 300, 500, 580, 660 ];
+let cities = [];
 
 // the x position of each of the 3 silos
 const siloPos = [ 55, canvas.width / 2, 745 ];
+let silos = [];
 
-// the x/y position of each silo, the number of missiles left, and if
-// it is still alive
-let silos = [
-  { x: siloPos[0], y: siloY, missiles: 10, alive: true },
-  { x: siloPos[1], y: siloY, missiles: 10, alive: true },
-  { x: siloPos[2], y: siloY, missiles: 10, alive: true }
-];
-
-// the x/y position of each missile spawn point. missiles spawn
+// the x position of each missile spawn point. missiles spawn
 // directly above each city and silo plus the two edges
-const missileSpawns = cities
-  .concat(silos)
-  .concat([{ x: 0, y: 0 }, { x: canvas.width, y: 0 }])
-  .map(pos => ({ x: pos.x, y: 0 }));
+const missileSpawns = cityPos.concat(siloPos).concat([ 0, canvas.width ]);
+
+// pre-generated star field for the background
+const stars = [];
+for (let i = 0; i < 80; i++) {
+  stars.push({
+    x: Math.random() * canvas.width,
+    y: Math.random() * (groundY - 40),
+    r: Math.random() * 1.3 + 0.3
+  });
+}
+
+// tiny sound effects with the web audio api. created lazily on the
+// first click because browsers block audio before a user gesture
+let audioCtx = null;
+function sound(freq, endFreq, duration, type, volume) {
+  if (!audioCtx) return;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  const now = audioCtx.currentTime;
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, now);
+  osc.frequency.exponentialRampToValueAtTime(endFreq, now + duration);
+  gain.gain.setValueAtTime(volume, now);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start(now);
+  osc.stop(now + duration);
+}
+const launchSound = () => sound(600, 150, 0.25, 'square', 0.06);
+const boomSound = () => sound(120, 30, 0.4, 'sawtooth', 0.12);
+const loseSound = () => sound(300, 40, 1.2, 'sawtooth', 0.15);
 
 // return a random integer between min (inclusive) and max (inclusive)
 // @see https://stackoverflow.com/a/1527820/2124254
@@ -114,58 +140,135 @@ function distance(source, target) {
   return Math.hypot(source.x - target.x, source.y - target.y);
 }
 
-// spawn a missile by choosing a spawn point and a target.
-// a missile can target any city or silo
-function spawnMissile() {
-  const targets = cities.concat(silos);
+// enemy missiles get faster and more numerous each level
+function missileSpeed() {
+  return Math.min(0.8 + level * 0.15, 3);
+}
+function missilesThisLevel() {
+  return 8 + level * 3;
+}
 
-  const randSpawn = randInt(0, missileSpawns.length - 1);
-  const randTarget = randInt(0, targets.length - 1);
-  const start = missileSpawns[randSpawn];
-  const target = targets[randTarget];
+function addExplosion(x, y) {
+  explosions.push({ x, y, size: 2, dir: 1, alive: true });
+  boomSound();
+}
+
+function addPopup(x, y, text) {
+  popups.push({ x, y, text, life: 60 });
+}
+
+// spawn a missile from a random spawn point aimed at a random living
+// city or silo. the target position is copied so the missile keeps
+// flying at the same spot even if its target is destroyed first
+function spawnMissile(startX, startY) {
+  const targets = cities.concat(silos).filter(t => t.alive);
+  if (!targets.length) return;
+
+  const start = {
+    x: startX !== undefined ? startX : missileSpawns[randInt(0, missileSpawns.length - 1)],
+    y: startY !== undefined ? startY : 0
+  };
+  const targetObj = targets[randInt(0, targets.length - 1)];
+  const target = { x: targetObj.x, y: targetObj.y };
   const angle = angleBetweenPoints(start, target);
+  const speed = missileSpeed();
 
   missiles.push({
-    start,  // where the missile started
-    target, // where the missile is going
-    pos: { x: start.x, y: start.y },  // current position
-    alive: true,  // if we should still draw the missile
+    start,
+    target,
+    targetObj,
+    pos: { x: start.x, y: start.y },
+    alive: true,
 
-    // used to update the position every frame
-    dx: missileSpeed * Math.sin(angle),
-    dy: missileSpeed * -Math.cos(angle)
+    // from level 4 on some missiles split into more warheads mid-flight
+    splitAt: (level >= 4 && startY === undefined && Math.random() < 0.25)
+      ? randInt(100, 250)
+      : null,
+
+    dx: speed * Math.sin(angle),
+    dy: speed * -Math.cos(angle)
   });
 }
 
+function startWave() {
+  state = 'playing';
+  missilesToSpawn = missilesThisLevel();
+  lastSpawnTime = -Infinity;
+  waveBonus = 0;
+
+  // silos restock and rebuild each wave, destroyed cities stay dead
+  silos = siloPos.map(x => ({ x, y: siloY, missiles: 10, alive: true }));
+}
+
+function resetGame() {
+  score = 0;
+  level = 1;
+  missiles = [];
+  counterMissiles = [];
+  explosions = [];
+  popups = [];
+  cities = cityPos.map(x => ({ x, y: cityY, alive: true }));
+  startWave();
+}
+
+function saveHighScore() {
+  if (score > highScore) {
+    highScore = score;
+    try { localStorage.setItem('nq-mc-highscore', highScore); } catch (e) {}
+  }
+}
+
+// draw a city as a little skyline of buildings
+function drawCity(city) {
+  const left = city.x - cityWidth / 2;
+  context.fillStyle = '#08f';
+  context.fillRect(left, city.y + 10, cityWidth, cityHeight - 10);
+  context.fillRect(left + 4, city.y + 4, 9, cityHeight - 4);
+  context.fillRect(left + 18, city.y, 10, cityHeight);
+  context.fillRect(left + 33, city.y + 6, 8, cityHeight - 6);
+
+  // windows
+  context.fillStyle = '#9df';
+  for (let wx = left + 6; wx < left + cityWidth - 4; wx += 8) {
+    context.fillRect(wx, city.y + 14, 3, 3);
+    context.fillRect(wx, city.y + 20, 3, 3);
+  }
+}
+
+function drawCenteredText(text, y, size, color) {
+  context.fillStyle = color;
+  context.font = 'bold ' + size + 'px monospace';
+  context.textAlign = 'center';
+  context.fillText(text, canvas.width / 2, y);
+}
+
 // game loop
-// start at -2 seconds (time is in milliseconds) to give the player 1
-// second before the missiles start
-let lastTime = -2000;
 function loop(time) {
   requestAnimationFrame(loop);
-  context.clearRect(0,0,canvas.width,canvas.height);
+  context.clearRect(0, 0, canvas.width, canvas.height);
 
-  // spawn missiles every interval of 3 seconds (if the level allows
-  // more missiles)
-  if (time - lastTime > 3000 && currInterval < levels[currLevel].length) {
-    for (let i = 0; i < levels[currLevel][currInterval]; i++) {
+  // stars
+  context.fillStyle = '#556';
+  stars.forEach(star => {
+    context.fillRect(star.x, star.y, star.r, star.r);
+  });
+
+  // spawn missiles in small clusters every few seconds until the
+  // wave's quota is used up. clusters get bigger on later levels
+  if (state === 'playing' && missilesToSpawn > 0 && time - lastSpawnTime > 3000) {
+    const cluster = Math.min(missilesToSpawn, randInt(2, 2 + Math.ceil(level / 2)));
+    for (let i = 0; i < cluster; i++) {
       spawnMissile();
     }
-
-    currInterval++;
-    lastTime = time;
+    missilesToSpawn -= cluster;
+    lastSpawnTime = time;
   }
 
   // draw cities
-  context.fillStyle = 'blue';
-  cities.forEach(city => {
-
-    // center the city on the x position
-    context.fillRect(city.x - cityWidth / 2, city.y, cityWidth, cityHeight);
-  });
+  cities.forEach(drawCity);
 
   // draw ground and silos
-  context.fillStyle = 'yellow';
+  context.fillStyle = '#dbb020';
   context.beginPath();
   context.moveTo(0, canvas.height);
   context.lineTo(0, groundY);
@@ -185,6 +288,7 @@ function loop(time) {
   // draw the number of counter-missiles each silo
   context.fillStyle = 'black';
   silos.forEach(silo => {
+    if (!silo.alive) return;
 
     // draw missiles in a triangular shape by incrementing how many
     // missiles we can draw per row
@@ -204,6 +308,12 @@ function loop(time) {
         count = 0;
       }
     }
+
+    if (silo.missiles === 0) {
+      context.font = 'bold 11px monospace';
+      context.textAlign = 'center';
+      context.fillText('OUT', silo.x, silo.y + 18);
+    }
   });
 
   // update and draw missiles
@@ -211,31 +321,37 @@ function loop(time) {
   context.lineWidth = 2;
 
   // update color based on time so it "blinks"
-  // by dividing by a number and seeing if it's odd or even we can
-  // change the speed of the blinking
-  context.fillStyle = 'white';
-  if (Math.round(time / 2) % 2 === 0) {
-    context.fillStyle = 'black';
-  }
+  context.fillStyle = Math.round(time / 2) % 2 === 0 ? 'white' : 'yellow';
 
   missiles.forEach(missile => {
     missile.pos.x += missile.dx;
     missile.pos.y += missile.dy;
 
+    // split into extra warheads mid-flight
+    if (missile.splitAt !== null && missile.pos.y >= missile.splitAt) {
+      missile.splitAt = null;
+      const splits = randInt(1, 2);
+      for (let i = 0; i < splits; i++) {
+        spawnMissile(missile.pos.x, missile.pos.y);
+      }
+    }
+
     // check if the missile hit an explosion by doing a circle-circle
     // collision check
     explosions.forEach(explosion => {
       const dist = distance(explosion, missile.pos);
-      if (dist < missileSize + explosion.size) {
+      if (dist < missileSize + explosion.size && missile.alive) {
         missile.alive = false;
+        score += missileScore * level;
+        addPopup(missile.pos.x, missile.pos.y, '+' + missileScore * level);
       }
     });
 
-    // if missile is close the the target we blow it up
+    // if missile is close to the target we blow it up
     const dist = distance(missile.pos, missile.target);
-    if (dist < missileSpeed) {
+    if (dist < Math.max(missileSpeed(), 2)) {
       missile.alive = false;
-      missile.target.alive = false;
+      missile.targetObj.alive = false;
     }
 
     if (missile.alive) {
@@ -249,34 +365,22 @@ function loop(time) {
     }
     // a dead missile spawns an explosion
     else {
-      explosions.push({
-        x: missile.pos.x,
-        y: missile.pos.y,
-        size: 2,
-        dir: 1,
-        alive: true
-      });
+      addExplosion(missile.pos.x, missile.pos.y);
     }
   });
 
   // update and draw counter missiles
-  context.strokeStyle = 'blue';
+  context.strokeStyle = '#4af';
   context.fillStyle = 'white';
   counterMissiles.forEach(missile => {
     missile.pos.x += missile.dx;
     missile.pos.y += missile.dy;
 
-    // if missile is close the the target we blow it up
+    // if missile is close to the target we blow it up
     const dist = distance(missile.pos, missile.target);
     if (dist < counterMissileSpeed) {
       missile.alive = false;
-      explosions.push({
-        x: missile.pos.x,
-        y: missile.pos.y,
-        size: 2,
-        dir: 1,
-        alive: true
-      });
+      addExplosion(missile.pos.x, missile.pos.y);
     }
     else {
       context.beginPath();
@@ -285,6 +389,17 @@ function loop(time) {
       context.stroke();
 
       context.fillRect(missile.pos.x - 2, missile.pos.y - 2, 4, 4);
+
+      // draw an x where the counter-missile is headed
+      context.strokeStyle = '#4af';
+      context.lineWidth = 1;
+      context.beginPath();
+      context.moveTo(missile.target.x - 4, missile.target.y - 4);
+      context.lineTo(missile.target.x + 4, missile.target.y + 4);
+      context.moveTo(missile.target.x + 4, missile.target.y - 4);
+      context.lineTo(missile.target.x - 4, missile.target.y + 4);
+      context.stroke();
+      context.lineWidth = 2;
     }
   });
 
@@ -293,7 +408,7 @@ function loop(time) {
     explosion.size += 0.35 * explosion.dir;
 
     // change the direction of the explosion to wane
-    if (explosion.size > 30) {
+    if (explosion.size > maxExplosionSize) {
       explosion.dir = -1;
     }
 
@@ -302,15 +417,30 @@ function loop(time) {
       explosion.alive = false;
     }
     else {
-      context.fillStyle = 'white';
-      if (Math.round(time / 3) % 2 === 0) {
-        context.fillStyle = 'blue';
-      }
 
+      // explosions near the ground take out cities and silos too
+      cities.concat(silos).forEach(building => {
+        if (building.alive && distance(explosion, building) < explosion.size + 10) {
+          building.alive = false;
+        }
+      });
+
+      const colors = ['#fff', '#ff4', '#f80', '#f44'];
+      context.fillStyle = colors[Math.round(time / 60) % colors.length];
       context.beginPath();
       context.arc(explosion.x, explosion.y, explosion.size, 0, 2 * Math.PI);
       context.fill();
     }
+  });
+
+  // draw floating score popups
+  context.font = 'bold 12px monospace';
+  context.textAlign = 'center';
+  popups.forEach(popup => {
+    popup.life--;
+    popup.y -= 0.4;
+    context.fillStyle = 'rgba(255,255,150,' + (popup.life / 60) + ')';
+    context.fillText(popup.text, popup.x, popup.y);
   });
 
   // remove dead missiles, explosions, cities, and silos
@@ -318,16 +448,95 @@ function loop(time) {
   counterMissiles = counterMissiles.filter(missile => missile.alive);
   explosions = explosions.filter(explosion => explosion.alive);
   cities = cities.filter(city => city.alive);
-  silos = silos.filter(silo => silo.alive);
+  popups = popups.filter(popup => popup.life > 0);
+
+  // HUD
+  context.textAlign = 'left';
+  context.font = 'bold 16px monospace';
+  context.fillStyle = 'white';
+  context.fillText('SCORE ' + score, 10, 24);
+  context.textAlign = 'right';
+  context.fillText('HIGH ' + Math.max(highScore, score), canvas.width - 10, 24);
+  drawCenteredText('WAVE ' + level, 24, 16, 'white');
+
+  // state transitions
+  const quiet = missilesToSpawn === 0 && !missiles.length && !explosions.length;
+
+  if (state === 'playing') {
+    if (!cities.length) {
+
+      // let the last explosions finish before ending the game
+      if (!missiles.length && !explosions.length) {
+        state = 'game-over';
+        stateTime = time;
+        saveHighScore();
+        loseSound();
+      }
+    }
+    else if (quiet) {
+      state = 'wave-end';
+      stateTime = time;
+
+      // tally the wave bonus
+      const ammoLeft = silos.reduce((sum, silo) => sum + (silo.alive ? silo.missiles : 0), 0);
+      waveBonus = cities.length * cityBonus + ammoLeft * ammoBonus;
+      score += waveBonus;
+      saveHighScore();
+    }
+  }
+  else if (state === 'wave-end') {
+    drawCenteredText('WAVE ' + level + ' CLEAR', 220, 32, '#ff4');
+    drawCenteredText('CITY BONUS + AMMO BONUS: ' + waveBonus, 260, 18, 'white');
+    drawCenteredText('get ready...', 300, 16, '#aaa');
+
+    if (time - stateTime > 3000) {
+      level++;
+      startWave();
+    }
+  }
+  else if (state === 'game-over') {
+    drawCenteredText('THE END', 220, 48, '#f44');
+    drawCenteredText('FINAL SCORE: ' + score, 270, 22, 'white');
+    if (score >= highScore && score > 0) {
+      drawCenteredText('NEW HIGH SCORE!', 300, 18, '#ff4');
+    }
+    if (time - stateTime > 1500) {
+      drawCenteredText('click to play again', 340, 16, '#aaa');
+    }
+  }
+  else if (state === 'ready') {
+    drawCenteredText('MISSILE COMMAND', 200, 40, 'white');
+    drawCenteredText('defend your cities', 240, 18, '#aaa');
+    drawCenteredText('click to fire from the nearest silo', 270, 16, '#aaa');
+    drawCenteredText('click to start', 330, 20, '#ff4');
+  }
 }
 
 // listen to mouse events to fire counter-missiles
 canvas.addEventListener('click', e => {
-  // get the x/y position of the mouse pointer by subtracting the x/y
-  // position of the canvas element from the x/y position of the
-  // pointer
-  const x = e.clientX - e.target.offsetLeft;
-  const y = e.clientY - e.target.offsetTop;
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (err) {}
+  }
+
+  if (state === 'ready') {
+    resetGame();
+    return;
+  }
+  if (state === 'game-over') {
+
+    // small delay so a frantic last click doesn't instantly restart
+    if (performance.now() - stateTime > 1500) {
+      resetGame();
+    }
+    return;
+  }
+  if (state !== 'playing') return;
+
+  // get the x/y position of the mouse pointer in canvas coordinates,
+  // accounting for page scroll and any css scaling of the canvas
+  const rect = canvas.getBoundingClientRect();
+  const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+  const y = Math.min((e.clientY - rect.top) * (canvas.height / rect.height), siloY - 10);
 
   // determine which silo is closest to the pointer and fire a
   // counter-missile from it
@@ -335,7 +544,7 @@ canvas.addEventListener('click', e => {
   let siloDistance = Infinity;  // start at the largest number
   silos.forEach(silo => {
     const dist = distance({ x, y }, silo);
-    if (dist < siloDistance && silo.missiles) {
+    if (dist < siloDistance && silo.missiles && silo.alive) {
       siloDistance = dist;
       launchSilo = silo;
     }
@@ -346,10 +555,11 @@ canvas.addEventListener('click', e => {
     const target = { x, y };
     const angle = angleBetweenPoints(start, target);
     launchSilo.missiles--;
+    launchSound();
     counterMissiles.push({
       start,
       target,
-      pos: { x: launchSilo.x, y: launchSilo. y},
+      pos: { x: launchSilo.x, y: launchSilo.y },
       dx: counterMissileSpeed * Math.sin(angle),
       dy: counterMissileSpeed * -Math.cos(angle),
       alive: true
