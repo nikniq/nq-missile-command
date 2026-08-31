@@ -55,8 +55,10 @@ const maxExplosionSize = 30;
 
 // scoring
 const missileScore = 25;      // points per enemy missile destroyed
+const bomberScore = 100;      // points per bomber shot down
 const cityBonus = 100;        // wave-end bonus per surviving city
 const ammoBonus = 5;          // wave-end bonus per unused counter-missile
+const bonusCityEvery = 5000;  // rebuild a city every time this many points is reached
 
 // game state: 'ready' | 'playing' | 'wave-end' | 'game-over'
 let state = 'ready';
@@ -71,10 +73,21 @@ let missiles = [];
 let counterMissiles = [];
 let explosions = [];
 let popups = [];              // floating score texts
+let bombers = [];
+
+let paused = false;
+let muted = false;
+let pauseStart = 0;
+let shake = 0;                // screen shake intensity
+let nextCityScore = bonusCityEvery;
+let bonusCitiesEarned = 0;    // dead cities waiting to be rebuilt at wave end
+let rebuiltCity = false;      // show the rebuild message on the wave-end screen
 
 // per-wave spawn bookkeeping
 let missilesToSpawn = 0;
+let bombersToSpawn = 0;
 let lastSpawnTime = 0;
+let lastBomberTime = 0;
 
 const cityPos = [ 140, 220, 300, 500, 580, 660 ];
 let cities = [];
@@ -101,7 +114,7 @@ for (let i = 0; i < 80; i++) {
 // first click because browsers block audio before a user gesture
 let audioCtx = null;
 function sound(freq, endFreq, duration, type, volume) {
-  if (!audioCtx) return;
+  if (!audioCtx || muted) return;
   const osc = audioCtx.createOscillator();
   const gain = audioCtx.createGain();
   const now = audioCtx.currentTime;
@@ -193,10 +206,13 @@ function spawnMissile(startX, startY) {
 function startWave() {
   state = 'playing';
   missilesToSpawn = missilesThisLevel();
+  bombersToSpawn = level >= 3 ? Math.min(1 + Math.floor((level - 3) / 2), 4) : 0;
   lastSpawnTime = -Infinity;
+  lastBomberTime = 0;
   waveBonus = 0;
 
   // silos restock and rebuild each wave, destroyed cities stay dead
+  // (unless a bonus city was earned)
   silos = siloPos.map(x => ({ x, y: siloY, missiles: 10, alive: true }));
 }
 
@@ -207,8 +223,20 @@ function resetGame() {
   counterMissiles = [];
   explosions = [];
   popups = [];
+  bombers = [];
+  shake = 0;
+  nextCityScore = bonusCityEvery;
+  bonusCitiesEarned = 0;
   cities = cityPos.map(x => ({ x, y: cityY, alive: true }));
   startWave();
+}
+
+// bank a bonus city every time the score passes another threshold
+function checkBonusCity() {
+  while (score >= nextCityScore) {
+    nextCityScore += bonusCityEvery;
+    bonusCitiesEarned++;
+  }
 }
 
 function saveHighScore() {
@@ -245,7 +273,18 @@ function drawCenteredText(text, y, size, color) {
 // game loop
 function loop(time) {
   requestAnimationFrame(loop);
+
+  // while paused, leave the last frame on screen untouched
+  if (paused) return;
+
   context.clearRect(0, 0, canvas.width, canvas.height);
+
+  // shake the whole scene when a building was just destroyed
+  context.save();
+  if (shake > 0) {
+    context.translate((Math.random() - 0.5) * shake, (Math.random() - 0.5) * shake);
+    shake = Math.max(0, shake - 0.5);
+  }
 
   // stars
   context.fillStyle = '#556';
@@ -264,8 +303,30 @@ function loop(time) {
     lastSpawnTime = time;
   }
 
-  // draw cities
-  cities.forEach(drawCity);
+  // send in a bomber every so often on later waves
+  if (state === 'playing' && bombersToSpawn > 0 && time - lastBomberTime > 6000) {
+    const fromLeft = Math.random() < 0.5;
+    bombers.push({
+      x: fromLeft ? -30 : canvas.width + 30,
+      y: randInt(80, 180),
+      dx: (fromLeft ? 1 : -1) * (0.7 + level * 0.05),
+      nextDrop: time + randInt(1000, 2500),
+      alive: true
+    });
+    bombersToSpawn--;
+    lastBomberTime = time;
+  }
+
+  // draw cities (dead ones leave a rubble mound)
+  cities.forEach(city => {
+    if (city.alive) {
+      drawCity(city);
+    }
+    else {
+      context.fillStyle = '#642';
+      context.fillRect(city.x - cityWidth / 2, groundY - 6, cityWidth, 6);
+    }
+  });
 
   // draw ground and silos
   context.fillStyle = '#dbb020';
@@ -316,6 +377,40 @@ function loop(time) {
     }
   });
 
+  // update and draw bombers
+  bombers.forEach(bomber => {
+    bomber.x += bomber.dx;
+
+    // drop a missile every couple of seconds while over the screen
+    if (time > bomber.nextDrop && bomber.x > 40 && bomber.x < canvas.width - 40) {
+      bomber.nextDrop = time + randInt(1500, 3000);
+      spawnMissile(bomber.x, bomber.y + 8);
+    }
+
+    // bombers die to explosions like missiles do
+    explosions.forEach(explosion => {
+      if (bomber.alive && distance(explosion, bomber) < 12 + explosion.size) {
+        bomber.alive = false;
+        score += bomberScore * level;
+        addPopup(bomber.x, bomber.y, '+' + bomberScore * level);
+        addExplosion(bomber.x, bomber.y);
+      }
+    });
+
+    // remove once fully off screen
+    if (bomber.x < -50 || bomber.x > canvas.width + 50) {
+      bomber.alive = false;
+    }
+
+    if (bomber.alive) {
+      context.fillStyle = '#3d5';
+      context.fillRect(bomber.x - 14, bomber.y - 3, 28, 6);   // fuselage
+      context.fillRect(bomber.x - 4, bomber.y - 8, 8, 5);     // canopy
+      const tailX = bomber.dx > 0 ? bomber.x - 14 : bomber.x + 10;
+      context.fillRect(tailX, bomber.y - 9, 4, 6);            // tail
+    }
+  });
+
   // update and draw missiles
   context.strokeStyle = 'red';
   context.lineWidth = 2;
@@ -343,6 +438,7 @@ function loop(time) {
       if (dist < missileSize + explosion.size && missile.alive) {
         missile.alive = false;
         score += missileScore * level;
+        checkBonusCity();
         addPopup(missile.pos.x, missile.pos.y, '+' + missileScore * level);
       }
     });
@@ -351,7 +447,10 @@ function loop(time) {
     const dist = distance(missile.pos, missile.target);
     if (dist < Math.max(missileSpeed(), 2)) {
       missile.alive = false;
-      missile.targetObj.alive = false;
+      if (missile.targetObj.alive) {
+        missile.targetObj.alive = false;
+        shake = 14;
+      }
     }
 
     if (missile.alive) {
@@ -376,11 +475,12 @@ function loop(time) {
     missile.pos.x += missile.dx;
     missile.pos.y += missile.dy;
 
-    // if missile is close to the target we blow it up
+    // if missile is close to the target we blow it up exactly at the
+    // point that was clicked (instead of up to a full step early)
     const dist = distance(missile.pos, missile.target);
     if (dist < counterMissileSpeed) {
       missile.alive = false;
-      addExplosion(missile.pos.x, missile.pos.y);
+      addExplosion(missile.target.x, missile.target.y);
     }
     else {
       context.beginPath();
@@ -422,6 +522,7 @@ function loop(time) {
       cities.concat(silos).forEach(building => {
         if (building.alive && distance(explosion, building) < explosion.size + 10) {
           building.alive = false;
+          shake = 14;
         }
       });
 
@@ -443,11 +544,12 @@ function loop(time) {
     context.fillText(popup.text, popup.x, popup.y);
   });
 
-  // remove dead missiles, explosions, cities, and silos
+  // remove dead missiles, explosions, and bombers. dead cities stay
+  // in the array so bonus cities can rebuild them
   missiles = missiles.filter(missile => missile.alive);
   counterMissiles = counterMissiles.filter(missile => missile.alive);
   explosions = explosions.filter(explosion => explosion.alive);
-  cities = cities.filter(city => city.alive);
+  bombers = bombers.filter(bomber => bomber.alive);
   popups = popups.filter(popup => popup.life > 0);
 
   // HUD
@@ -460,10 +562,12 @@ function loop(time) {
   drawCenteredText('WAVE ' + level, 24, 16, 'white');
 
   // state transitions
-  const quiet = missilesToSpawn === 0 && !missiles.length && !explosions.length;
+  const aliveCities = cities.filter(city => city.alive).length;
+  const quiet = missilesToSpawn === 0 && bombersToSpawn === 0 &&
+    !missiles.length && !explosions.length && !bombers.length;
 
   if (state === 'playing') {
-    if (!cities.length) {
+    if (!aliveCities && !bonusCitiesEarned) {
 
       // let the last explosions finish before ending the game
       if (!missiles.length && !explosions.length) {
@@ -479,17 +583,31 @@ function loop(time) {
 
       // tally the wave bonus
       const ammoLeft = silos.reduce((sum, silo) => sum + (silo.alive ? silo.missiles : 0), 0);
-      waveBonus = cities.length * cityBonus + ammoLeft * ammoBonus;
+      waveBonus = aliveCities * cityBonus + ammoLeft * ammoBonus;
       score += waveBonus;
+      checkBonusCity();
+
+      // spend banked bonus cities on rebuilding dead ones
+      while (bonusCitiesEarned > 0) {
+        const dead = cities.filter(city => !city.alive);
+        if (!dead.length) break;
+        dead[randInt(0, dead.length - 1)].alive = true;
+        bonusCitiesEarned--;
+        rebuiltCity = true;
+      }
       saveHighScore();
     }
   }
   else if (state === 'wave-end') {
     drawCenteredText('WAVE ' + level + ' CLEAR', 220, 32, '#ff4');
     drawCenteredText('CITY BONUS + AMMO BONUS: ' + waveBonus, 260, 18, 'white');
-    drawCenteredText('get ready...', 300, 16, '#aaa');
+    if (rebuiltCity) {
+      drawCenteredText('BONUS CITY REBUILT!', 292, 18, '#3d5');
+    }
+    drawCenteredText('get ready...', 324, 16, '#aaa');
 
     if (time - stateTime > 3000) {
+      rebuiltCity = false;
       level++;
       startWave();
     }
@@ -508,8 +626,19 @@ function loop(time) {
     drawCenteredText('MISSILE COMMAND', 200, 40, 'white');
     drawCenteredText('defend your cities', 240, 18, '#aaa');
     drawCenteredText('click to fire from the nearest silo', 270, 16, '#aaa');
-    drawCenteredText('click to start', 330, 20, '#ff4');
+    drawCenteredText('bonus city every ' + bonusCityEvery + ' points', 294, 14, '#aaa');
+    drawCenteredText('P pauses, M mutes', 316, 14, '#aaa');
+    drawCenteredText('click to start', 360, 20, '#ff4');
   }
+
+  if (muted) {
+    context.textAlign = 'right';
+    context.font = 'bold 12px monospace';
+    context.fillStyle = '#888';
+    context.fillText('MUTED', canvas.width - 10, 42);
+  }
+
+  context.restore();
 }
 
 // listen to mouse events to fire counter-missiles
@@ -530,7 +659,7 @@ canvas.addEventListener('click', e => {
     }
     return;
   }
-  if (state !== 'playing') return;
+  if (state !== 'playing' || paused) return;
 
   // get the x/y position of the mouse pointer in canvas coordinates,
   // accounting for page scroll and any css scaling of the canvas
@@ -564,6 +693,30 @@ canvas.addEventListener('click', e => {
       dy: counterMissileSpeed * -Math.cos(angle),
       alive: true
     });
+  }
+});
+
+// P pauses the game, M toggles sound
+document.addEventListener('keydown', e => {
+  if (e.key === 'm' || e.key === 'M') {
+    muted = !muted;
+  }
+  else if ((e.key === 'p' || e.key === 'P') && (state === 'playing' || paused)) {
+    paused = !paused;
+
+    if (paused) {
+      pauseStart = performance.now();
+      drawCenteredText('PAUSED', 280, 40, 'white');
+    }
+    else {
+
+      // shift all timers forward so the wave doesn't jump on unpause
+      const pausedFor = performance.now() - pauseStart;
+      lastSpawnTime += pausedFor;
+      lastBomberTime += pausedFor;
+      stateTime += pausedFor;
+      bombers.forEach(bomber => bomber.nextDrop += pausedFor);
+    }
   }
 });
 
