@@ -50,11 +50,12 @@ const cityY = groundY - cityHeight;  // y position of the city
 const siloY = groundY - 30;  // y position of the top of the silo
 const missileSize = 4;  // the radius/size of a missile
 
-const counterMissileSpeed = 15;  // how fast a counter-missile moves
+const siloSpeeds = [ 9, 18, 9 ];  // counter-missile speed per silo (center is fastest)
 const maxExplosionSize = 30;
 
 // scoring
 const missileScore = 25;      // points per enemy missile destroyed
+const smartScore = 125;       // points per smart bomb destroyed
 const bomberScore = 100;      // points per bomber shot down
 const cityBonus = 100;        // wave-end bonus per surviving city
 const ammoBonus = 5;          // wave-end bonus per unused counter-missile
@@ -79,6 +80,10 @@ let paused = false;
 let muted = false;
 let pauseStart = 0;
 let shake = 0;                // screen shake intensity
+let flash = 0;                // white flash frames when a building dies
+let debris = [];              // building debris particles
+let fadingTrails = [];        // missile trails fading out after death
+let mouse = { x: canvas.width / 2, y: 250 };  // for keyboard-fired silos
 let nextCityScore = bonusCityEvery;
 let bonusCitiesEarned = 0;    // dead cities waiting to be rebuilt at wave end
 let rebuiltCity = false;      // show the rebuild message on the wave-end screen
@@ -170,6 +175,35 @@ function addPopup(x, y, text) {
   popups.push({ x, y, text, life: 60 });
 }
 
+// a building blowing up: screen shake, white flash, and debris
+function destroyBuilding(building) {
+  building.alive = false;
+  shake = 14;
+  flash = 5;
+  for (let i = 0; i < 18; i++) {
+    debris.push({
+      x: building.x + randInt(-15, 15),
+      y: building.y,
+      dx: (Math.random() - 0.5) * 4,
+      dy: -Math.random() * 4 - 1,
+      color: ['#08f', '#9df', '#dbb020', '#f80'][randInt(0, 3)],
+      life: randInt(30, 60)
+    });
+  }
+}
+
+// keep a missile's trail on screen briefly after it dies
+function addFadingTrail(missile, rgb) {
+  fadingTrails.push({
+    x1: missile.smart ? missile.pos.x - missile.dx * 12 : missile.start.x,
+    y1: missile.smart ? missile.pos.y - missile.dy * 12 : missile.start.y,
+    x2: missile.pos.x,
+    y2: missile.pos.y,
+    rgb,
+    life: 30
+  });
+}
+
 // spawn a missile from a random spawn point aimed at a random living
 // city or silo. the target position is copied so the missile keeps
 // flying at the same spot even if its target is destroyed first
@@ -184,7 +218,11 @@ function spawnMissile(startX, startY) {
   const targetObj = targets[randInt(0, targets.length - 1)];
   const target = { x: targetObj.x, y: targetObj.y };
   const angle = angleBetweenPoints(start, target);
-  const speed = missileSpeed();
+
+  // from level 5 on some missiles are smart bombs that swerve to
+  // dodge explosions. they are worth more and never split
+  const smart = level >= 5 && startY === undefined && Math.random() < 0.15;
+  const speed = missileSpeed() * (smart ? 0.85 : 1);
 
   missiles.push({
     start,
@@ -192,9 +230,11 @@ function spawnMissile(startX, startY) {
     targetObj,
     pos: { x: start.x, y: start.y },
     alive: true,
+    smart,
+    speed,
 
     // from level 4 on some missiles split into more warheads mid-flight
-    splitAt: (level >= 4 && startY === undefined && Math.random() < 0.25)
+    splitAt: (level >= 4 && !smart && startY === undefined && Math.random() < 0.25)
       ? randInt(100, 250)
       : null,
 
@@ -213,7 +253,7 @@ function startWave() {
 
   // silos restock and rebuild each wave, destroyed cities stay dead
   // (unless a bonus city was earned)
-  silos = siloPos.map(x => ({ x, y: siloY, missiles: 10, alive: true }));
+  silos = siloPos.map((x, i) => ({ x, y: siloY, missiles: 10, speed: siloSpeeds[i], alive: true }));
 }
 
 function resetGame() {
@@ -224,7 +264,10 @@ function resetGame() {
   explosions = [];
   popups = [];
   bombers = [];
+  debris = [];
+  fadingTrails = [];
   shake = 0;
+  flash = 0;
   nextCityScore = bonusCityEvery;
   bonusCitiesEarned = 0;
   cities = cityPos.map(x => ({ x, y: cityY, alive: true }));
@@ -419,6 +462,30 @@ function loop(time) {
   context.fillStyle = Math.round(time / 2) % 2 === 0 ? 'white' : 'yellow';
 
   missiles.forEach(missile => {
+
+    // smart bombs steer toward their target but swerve away from
+    // nearby explosions
+    if (missile.smart) {
+      const angle = angleBetweenPoints(missile.pos, missile.target);
+      let dx = missile.speed * Math.sin(angle);
+      let dy = missile.speed * -Math.cos(angle);
+
+      explosions.forEach(explosion => {
+        const dist = distance(explosion, missile.pos);
+        if (dist < 90 && dist > 0) {
+          const push = (90 - dist) / 90 * missile.speed * 2.5;
+          dx += (missile.pos.x - explosion.x) / dist * push;
+          dy += (missile.pos.y - explosion.y) / dist * push;
+        }
+      });
+
+      // renormalize so dodging doesn't change the speed, and never
+      // let a smart bomb fly back up off the screen
+      const mag = Math.hypot(dx, dy);
+      missile.dx = dx / mag * missile.speed;
+      missile.dy = Math.max(dy / mag * missile.speed, missile.speed * 0.2);
+    }
+
     missile.pos.x += missile.dx;
     missile.pos.y += missile.dy;
 
@@ -437,33 +504,56 @@ function loop(time) {
       const dist = distance(explosion, missile.pos);
       if (dist < missileSize + explosion.size && missile.alive) {
         missile.alive = false;
-        score += missileScore * level;
+        const points = (missile.smart ? smartScore : missileScore) * level;
+        score += points;
         checkBonusCity();
-        addPopup(missile.pos.x, missile.pos.y, '+' + missileScore * level);
+        addPopup(missile.pos.x, missile.pos.y, '+' + points);
       }
     });
 
     // if missile is close to the target we blow it up
     const dist = distance(missile.pos, missile.target);
-    if (dist < Math.max(missileSpeed(), 2)) {
+    if (dist < Math.max(missile.speed, 2)) {
       missile.alive = false;
       if (missile.targetObj.alive) {
-        missile.targetObj.alive = false;
-        shake = 14;
+        destroyBuilding(missile.targetObj);
       }
     }
 
     if (missile.alive) {
-      context.beginPath();
-      context.moveTo(missile.start.x, missile.start.y);
-      context.lineTo(missile.pos.x, missile.pos.y);
-      context.stroke();
+      if (missile.smart) {
 
-      // center the head of the missile to the x/y position
-      context.fillRect(missile.pos.x - missileSize / 2, missile.pos.y - missileSize / 2, missileSize, missileSize);
+        // smart bombs curve, so only a short trail behind the head
+        context.strokeStyle = '#3d5';
+        context.beginPath();
+        context.moveTo(missile.pos.x - missile.dx * 12, missile.pos.y - missile.dy * 12);
+        context.lineTo(missile.pos.x, missile.pos.y);
+        context.stroke();
+
+        // blinking green diamond
+        context.fillStyle = Math.round(time / 2) % 2 === 0 ? '#3d5' : 'white';
+        context.beginPath();
+        context.moveTo(missile.pos.x, missile.pos.y - 5);
+        context.lineTo(missile.pos.x + 5, missile.pos.y);
+        context.lineTo(missile.pos.x, missile.pos.y + 5);
+        context.lineTo(missile.pos.x - 5, missile.pos.y);
+        context.fill();
+        context.strokeStyle = 'red';
+      }
+      else {
+        context.beginPath();
+        context.moveTo(missile.start.x, missile.start.y);
+        context.lineTo(missile.pos.x, missile.pos.y);
+        context.stroke();
+
+        // center the head of the missile to the x/y position
+        context.fillStyle = Math.round(time / 2) % 2 === 0 ? 'white' : 'yellow';
+        context.fillRect(missile.pos.x - missileSize / 2, missile.pos.y - missileSize / 2, missileSize, missileSize);
+      }
     }
-    // a dead missile spawns an explosion
+    // a dead missile spawns an explosion and its trail fades out
     else {
+      addFadingTrail(missile, missile.smart ? '51,221,85' : '255,68,68');
       addExplosion(missile.pos.x, missile.pos.y);
     }
   });
@@ -478,8 +568,9 @@ function loop(time) {
     // if missile is close to the target we blow it up exactly at the
     // point that was clicked (instead of up to a full step early)
     const dist = distance(missile.pos, missile.target);
-    if (dist < counterMissileSpeed) {
+    if (dist < missile.speed) {
       missile.alive = false;
+      addFadingTrail(missile, '68,170,255');
       addExplosion(missile.target.x, missile.target.y);
     }
     else {
@@ -503,6 +594,28 @@ function loop(time) {
     }
   });
 
+  // draw fading trails of dead missiles
+  context.lineWidth = 2;
+  fadingTrails.forEach(trail => {
+    trail.life--;
+    context.strokeStyle = 'rgba(' + trail.rgb + ',' + (trail.life / 30) + ')';
+    context.beginPath();
+    context.moveTo(trail.x1, trail.y1);
+    context.lineTo(trail.x2, trail.y2);
+    context.stroke();
+  });
+
+  // update and draw building debris
+  debris.forEach(piece => {
+    piece.x += piece.dx;
+    piece.y += piece.dy;
+    piece.dy += 0.15;  // gravity
+    piece.life--;
+    if (piece.y > groundY) piece.life = 0;
+    context.fillStyle = piece.color;
+    context.fillRect(piece.x, piece.y, 3, 3);
+  });
+
   // update and draw explosions
   explosions.forEach(explosion => {
     explosion.size += 0.35 * explosion.dir;
@@ -521,8 +634,7 @@ function loop(time) {
       // explosions near the ground take out cities and silos too
       cities.concat(silos).forEach(building => {
         if (building.alive && distance(explosion, building) < explosion.size + 10) {
-          building.alive = false;
-          shake = 14;
+          destroyBuilding(building);
         }
       });
 
@@ -551,6 +663,8 @@ function loop(time) {
   explosions = explosions.filter(explosion => explosion.alive);
   bombers = bombers.filter(bomber => bomber.alive);
   popups = popups.filter(popup => popup.life > 0);
+  fadingTrails = fadingTrails.filter(trail => trail.life > 0);
+  debris = debris.filter(piece => piece.life > 0);
 
   // HUD
   context.textAlign = 'left';
@@ -626,9 +740,10 @@ function loop(time) {
     drawCenteredText('MISSILE COMMAND', 200, 40, 'white');
     drawCenteredText('defend your cities', 240, 18, '#aaa');
     drawCenteredText('click to fire from the nearest silo', 270, 16, '#aaa');
-    drawCenteredText('bonus city every ' + bonusCityEvery + ' points', 294, 14, '#aaa');
-    drawCenteredText('P pauses, M mutes', 316, 14, '#aaa');
-    drawCenteredText('click to start', 360, 20, '#ff4');
+    drawCenteredText('or press 1/2/3 to pick a silo - the center one is fastest', 294, 14, '#aaa');
+    drawCenteredText('bonus city every ' + bonusCityEvery + ' points - beware green smart bombs', 316, 14, '#aaa');
+    drawCenteredText('P pauses, M mutes', 338, 14, '#aaa');
+    drawCenteredText('click to start', 380, 20, '#ff4');
   }
 
   if (muted) {
@@ -638,8 +753,60 @@ function loop(time) {
     context.fillText('MUTED', canvas.width - 10, 42);
   }
 
+  // silo key labels
+  if (state === 'playing') {
+    context.font = 'bold 11px monospace';
+    context.textAlign = 'center';
+    context.fillStyle = '#975';
+    silos.forEach((silo, i) => {
+      context.fillText(String(i + 1), silo.x, groundY + 14);
+    });
+  }
+
   context.restore();
+
+  // white flash when a building is destroyed (drawn unshaken, on top)
+  if (flash > 0) {
+    context.fillStyle = 'rgba(255,255,255,' + (flash / 12) + ')';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    flash--;
+  }
 }
+
+// fire a counter-missile from a specific silo at a point
+function fireCounterMissile(silo, x, y) {
+  if (!silo || !silo.alive || !silo.missiles) return;
+
+  const start = { x: silo.x, y: silo.y };
+  const target = { x, y: Math.min(y, siloY - 10) };
+  const angle = angleBetweenPoints(start, target);
+  silo.missiles--;
+  launchSound();
+  counterMissiles.push({
+    start,
+    target,
+    pos: { x: silo.x, y: silo.y },
+    speed: silo.speed,
+    dx: silo.speed * Math.sin(angle),
+    dy: silo.speed * -Math.cos(angle),
+    alive: true
+  });
+}
+
+// convert a mouse event to canvas coordinates, accounting for page
+// scroll and any css scaling of the canvas
+function canvasPos(e) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: (e.clientX - rect.left) * (canvas.width / rect.width),
+    y: (e.clientY - rect.top) * (canvas.height / rect.height)
+  };
+}
+
+// remember where the pointer is so the 1/2/3 keys know where to aim
+canvas.addEventListener('mousemove', e => {
+  mouse = canvasPos(e);
+});
 
 // listen to mouse events to fire counter-missiles
 canvas.addEventListener('click', e => {
@@ -661,11 +828,7 @@ canvas.addEventListener('click', e => {
   }
   if (state !== 'playing' || paused) return;
 
-  // get the x/y position of the mouse pointer in canvas coordinates,
-  // accounting for page scroll and any css scaling of the canvas
-  const rect = canvas.getBoundingClientRect();
-  const x = (e.clientX - rect.left) * (canvas.width / rect.width);
-  const y = Math.min((e.clientY - rect.top) * (canvas.height / rect.height), siloY - 10);
+  const { x, y } = canvasPos(e);
 
   // determine which silo is closest to the pointer and fire a
   // counter-missile from it
@@ -679,27 +842,17 @@ canvas.addEventListener('click', e => {
     }
   });
 
-  if (launchSilo) {
-    const start = { x: launchSilo.x, y: launchSilo.y };
-    const target = { x, y };
-    const angle = angleBetweenPoints(start, target);
-    launchSilo.missiles--;
-    launchSound();
-    counterMissiles.push({
-      start,
-      target,
-      pos: { x: launchSilo.x, y: launchSilo.y },
-      dx: counterMissileSpeed * Math.sin(angle),
-      dy: counterMissileSpeed * -Math.cos(angle),
-      alive: true
-    });
-  }
+  fireCounterMissile(launchSilo, x, y);
 });
 
-// P pauses the game, M toggles sound
+// P pauses the game, M toggles sound, 1/2/3 fire specific silos at
+// the current mouse position
 document.addEventListener('keydown', e => {
   if (e.key === 'm' || e.key === 'M') {
     muted = !muted;
+  }
+  else if (e.key >= '1' && e.key <= '3' && state === 'playing' && !paused) {
+    fireCounterMissile(silos[e.key - 1], mouse.x, mouse.y);
   }
   else if ((e.key === 'p' || e.key === 'P') && (state === 'playing' || paused)) {
     paused = !paused;
