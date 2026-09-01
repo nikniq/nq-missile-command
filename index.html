@@ -50,8 +50,9 @@ const cityY = groundY - cityHeight;  // y position of the city
 const siloY = groundY - 30;  // y position of the top of the silo
 const missileSize = 4;  // the radius/size of a missile
 
-const siloSpeeds = [ 9, 18, 9 ];  // counter-missile speed per silo (center is fastest)
-const maxExplosionSize = 30;
+const siloSpeeds = [ 11, 18, 11 ];  // counter-missile speed per silo (center is fastest)
+const maxExplosionSize = 30;        // enemy explosion radius
+const counterExplosionSize = 42;    // your blasts are bigger than theirs
 
 // scoring
 const missileScore = 25;      // points per enemy missile destroyed
@@ -166,8 +167,17 @@ function missilesThisLevel() {
   return 8 + level * 3;
 }
 
-function addExplosion(x, y) {
-  explosions.push({ x, y, size: 2, dir: 1, alive: true });
+// friendly explosions (from counter-missiles) are bigger and never
+// damage your own cities and silos
+function addExplosion(x, y, friendly) {
+  explosions.push({
+    x, y,
+    size: 2,
+    dir: 1,
+    friendly: !!friendly,
+    maxSize: friendly ? counterExplosionSize : maxExplosionSize,
+    alive: true
+  });
   boomSound();
 }
 
@@ -252,8 +262,10 @@ function startWave() {
   waveBonus = 0;
 
   // silos restock and rebuild each wave, destroyed cities stay dead
-  // (unless a bonus city was earned)
-  silos = siloPos.map((x, i) => ({ x, y: siloY, missiles: 10, speed: siloSpeeds[i], alive: true }));
+  // (unless a bonus city was earned). ammo grows with the wave to
+  // keep up with the bigger missile counts
+  const ammo = 10 + Math.min(Math.floor(level / 2), 5);
+  silos = siloPos.map((x, i) => ({ x, y: siloY, missiles: ammo, speed: siloSpeeds[i], alive: true }));
 }
 
 function resetGame() {
@@ -515,6 +527,7 @@ function loop(time) {
     const dist = distance(missile.pos, missile.target);
     if (dist < Math.max(missile.speed, 2)) {
       missile.alive = false;
+      missile.hitGround = true;
       if (missile.targetObj.alive) {
         destroyBuilding(missile.targetObj);
       }
@@ -551,10 +564,13 @@ function loop(time) {
         context.fillRect(missile.pos.x - missileSize / 2, missile.pos.y - missileSize / 2, missileSize, missileSize);
       }
     }
-    // a dead missile spawns an explosion and its trail fades out
+    // a dead missile spawns an explosion and its trail fades out.
+    // an intercepted missile's blast counts as friendly (it chains
+    // onto other missiles but can't destroy your buildings) - only
+    // one that reached the ground makes a destructive enemy blast
     else {
       addFadingTrail(missile, missile.smart ? '51,221,85' : '255,68,68');
-      addExplosion(missile.pos.x, missile.pos.y);
+      addExplosion(missile.pos.x, missile.pos.y, !missile.hitGround);
     }
   });
 
@@ -571,7 +587,7 @@ function loop(time) {
     if (dist < missile.speed) {
       missile.alive = false;
       addFadingTrail(missile, '68,170,255');
-      addExplosion(missile.target.x, missile.target.y);
+      addExplosion(missile.target.x, missile.target.y, true);
     }
     else {
       context.beginPath();
@@ -621,7 +637,7 @@ function loop(time) {
     explosion.size += 0.35 * explosion.dir;
 
     // change the direction of the explosion to wane
-    if (explosion.size > maxExplosionSize) {
+    if (explosion.size > explosion.maxSize) {
       explosion.dir = -1;
     }
 
@@ -631,14 +647,20 @@ function loop(time) {
     }
     else {
 
-      // explosions near the ground take out cities and silos too
-      cities.concat(silos).forEach(building => {
-        if (building.alive && distance(explosion, building) < explosion.size + 10) {
-          destroyBuilding(building);
-        }
-      });
+      // enemy explosions near the ground take out cities and silos
+      // too. your own blasts never harm your buildings, so daring
+      // last-second intercepts are safe
+      if (!explosion.friendly) {
+        cities.concat(silos).forEach(building => {
+          if (building.alive && distance(explosion, building) < explosion.size + 10) {
+            destroyBuilding(building);
+          }
+        });
+      }
 
-      const colors = ['#fff', '#ff4', '#f80', '#f44'];
+      const colors = explosion.friendly
+        ? ['#fff', '#4af', '#39f', '#9df']
+        : ['#fff', '#ff4', '#f80', '#f44'];
       context.fillStyle = colors[Math.round(time / 60) % colors.length];
       context.beginPath();
       context.arc(explosion.x, explosion.y, explosion.size, 0, 2 * Math.PI);
